@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare Rust toolchain
+        run: rustup update stable
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build Tauri packages
+        shell: powershell
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) {
+            throw "Visual Studio Build Tools with C++ workload were not found."
+          }
+          $devCmd = Join-Path $vsPath "Common7\Tools\VsDevCmd.bat"
+          cmd.exe /d /s /c "call `"$devCmd`" -arch=x64 -host_arch=x64 && npm.cmd run tauri:build"
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          $artifacts = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.msi,*.exe | ForEach-Object { $_.FullName }
+          if (-not $artifacts) {
+            throw "No release artifacts were produced."
+          }
+          gh release create $env:RELEASE_TAG $artifacts --title "LoL Settings Changer $env:RELEASE_TAG" --notes "Automated Windows release for $env:RELEASE_TAG."

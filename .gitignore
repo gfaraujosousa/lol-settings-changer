@@ -1,0 +1,19 @@
+node_modules/
+dist/
+src-tauri/target/
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local planning/agent workspace metadata. Keep this out of the public repo.
+.agents/
+.planning/
+AGENTS.md

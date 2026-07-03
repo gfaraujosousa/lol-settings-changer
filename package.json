@@ -1,0 +1,39 @@
+{
+  "name": "lol-settings-changer",
+  "version": "0.1.0",
+  "description": "Windows desktop utility for saving and applying League of Legends PersistedSettings.json profiles.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/gfaraujosousa/lol-settings-changer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gfaraujosousa/lol-settings-changer/issues"
+  },
+  "homepage": "https://github.com/gfaraujosousa/lol-settings-changer#readme",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.6.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.6.0",
+    "@types/node": "^20.14.12",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "vitest": "^2.0.5"
+  }
+}

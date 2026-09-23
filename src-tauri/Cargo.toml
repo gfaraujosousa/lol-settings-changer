@@ -1,6 +1,6 @@
 [package]
 name = "lol-settings-changer"
-version = "0.1.0"
+version = "0.2.0"
 description = "LoL Settings Changer"
 authors = ["LoL Settings Changer"]
 license = ""
@@ -13,7 +13,8 @@ tauri-build = { version = "1.5", features = [] }
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "1.6", features = ["dialog-open"] }
+tauri = { version = "1.6", features = ["dialog-open", "system-tray", "shell-open", "http-request"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

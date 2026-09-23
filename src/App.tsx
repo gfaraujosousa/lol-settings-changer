@@ -1,10 +1,29 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { open } from '@tauri-apps/api/dialog';
 import { invoke } from '@tauri-apps/api/tauri';
+import { ActionToast } from './components/ActionToast';
+import { AppHeader } from './components/AppHeader';
+import { ChangelogTab } from './components/ChangelogTab';
+import { JobSidebar } from './components/JobSidebar';
+import { OnboardingTab } from './components/OnboardingTab';
+import { ProfileDossier } from './components/ProfileDossier';
+import { ProfileRoster } from './components/ProfileRoster';
+import { SavePanel } from './components/SavePanel';
+import { isAppTab, TabBar, type AppTab } from './components/TabBar';
+import { UpdateBanner } from './components/UpdateBanner';
+import { interpolate, useLocale } from './i18n/LocaleContext';
+import { ONBOARDING_STORAGE_KEY, TAB_STORAGE_KEY } from './i18n/locales';
+import {
+  checkAppUpdate,
+  skipUpdate,
+  startUpdateInstall,
+  type AvailableUpdate,
+} from './lib/appUpdate';
 import { BrowserKeyValueStore, loadSelectedPath, saveSelectedPath } from './lib/configPath';
-import { SETTINGS_FILE_NAME } from './lib/pathUtils';
+import { loadKeepInTray, saveKeepInTray } from './lib/idlePref';
 import type { ActivityEntry, ActivityIndexAdapter, ActivityStoreResult } from './lib/activityStore';
 import { appendActivityEntry, loadActivity } from './lib/activityStore';
+import { DEFAULT_PROFILE_ICON_ID, normalizeProfileIconId, type ProfileIconId } from './lib/profileIcons';
 import type { ProfileIndexAdapter, ProfileKind, ProfileStoreResult, SettingsProfile } from './lib/profileStore';
 import {
   createProfile,
@@ -28,7 +47,6 @@ import {
   messageForApplyResult,
   messageForLocalStoreRecoveryPrompt,
   messageForLocalStoreRecoverySuccess,
-  messageForPathStatus,
   messageForProfileDeleteResult,
   messageForProfileRenameResult,
   messageForProfileStoreResult,
@@ -91,56 +109,32 @@ function splitTags(tags: string): string[] {
     .filter(Boolean);
 }
 
-function formatDate(value: string): string {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+function busyLabel(busy: boolean, key: string, busyKey: string | null, idle: string, working: string): string {
+  return busy && busyKey === key ? working : idle;
 }
 
-function activityActionLabel(action: ActivityEntry['action']): string {
-  switch (action) {
-    case 'save_profile':
-      return 'Save profile';
-    case 'apply_profile':
-      return 'Apply profile';
-    case 'restore_backup':
-      return 'Restore backup';
+function readStoredTab(): AppTab {
+  try {
+    const seen = globalThis.localStorage?.getItem(ONBOARDING_STORAGE_KEY);
+    const stored = globalThis.localStorage?.getItem(TAB_STORAGE_KEY);
+    if (!seen) {
+      return 'start';
+    }
+    if (isAppTab(stored)) {
+      return stored;
+    }
+  } catch {
+    // ignore
   }
-}
-
-function formatFriendlyCode(code: string): string {
-  return code.replace(/_/g, ' ');
-}
-
-function ProfileButton({
-  profile,
-  selected,
-  onSelect,
-}: {
-  profile: SettingsProfile;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const descriptor = describeProfile(profile);
-
-  return (
-    <button
-      className={`profile-row${selected ? ' profile-row-selected' : ''}`}
-      type="button"
-      onClick={onSelect}
-      aria-pressed={selected}
-    >
-      <span>
-        <strong>{profile.name}</strong>
-        <small>{descriptor.freeformTags.length ? descriptor.freeformTags.join(', ') : 'No extra tags'}</small>
-      </span>
-    </button>
-  );
+  return 'start';
 }
 
 export default function App() {
+  const { messages } = useLocale();
   const store = useMemo(() => new BrowserKeyValueStore(), []);
   const profileAdapter = useMemo(() => new TauriProfileIndexAdapter(), []);
   const activityAdapter = useMemo(() => new TauriActivityIndexAdapter(), []);
+  const saveNameInputRef = useRef<HTMLInputElement>(null);
   const [path, setPath] = useState<string>('');
   const [status, setStatus] = useState<PathStatus>({ kind: 'not_selected', path: null });
   const [profiles, setProfiles] = useState<SettingsProfile[]>([]);
@@ -155,6 +149,7 @@ export default function App() {
   const [profileKind, setProfileKind] = useState<ProfileKind>('shared');
   const [accountName, setAccountName] = useState('');
   const [tagText, setTagText] = useState('');
+  const [profileIconId, setProfileIconId] = useState<ProfileIconId>(DEFAULT_PROFILE_ICON_ID);
   const [selectedProfileId, setSelectedProfileId] = useState('');
   const [pendingApplyId, setPendingApplyId] = useState('');
   const [pendingRestorePath, setPendingRestorePath] = useState('');
@@ -163,9 +158,16 @@ export default function App() {
   const [editKind, setEditKind] = useState<ProfileKind>('shared');
   const [editAccountName, setEditAccountName] = useState('');
   const [editTags, setEditTags] = useState('');
+  const [editIconId, setEditIconId] = useState<ProfileIconId>(DEFAULT_PROFILE_ICON_ID);
   const [deleteText, setDeleteText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [keepInTray, setKeepInTray] = useState(false);
   const [actionMessage, setActionMessage] = useState<UserMessage | null>(null);
+  const [tab, setTab] = useState<AppTab>(readStoredTab);
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
 
   const groupedProfiles = useMemo(() => groupProfiles(profiles), [profiles]);
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
@@ -184,6 +186,33 @@ export default function App() {
       }),
     [activityEntries],
   );
+
+  const labelBusy = useCallback(
+    (key: string, idle: string) => busyLabel(busy, key, busyKey, idle, messages.busy.working),
+    [busy, busyKey, messages.busy.working],
+  );
+
+  function changeTab(next: AppTab) {
+    setTab(next);
+    try {
+      globalThis.localStorage?.setItem(TAB_STORAGE_KEY, next);
+      if (next !== 'start') {
+        globalThis.localStorage?.setItem(ONBOARDING_STORAGE_KEY, '1');
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function startBusy(key: string) {
+    setBusyKey(key);
+    setBusy(true);
+  }
+
+  function endBusy() {
+    setBusy(false);
+    setBusyKey(null);
+  }
 
   function updateProfiles(nextProfiles: SettingsProfile[], preferredId = selectedProfileId) {
     setProfiles(nextProfiles);
@@ -265,7 +294,7 @@ export default function App() {
   }
 
   async function checkPath(nextPath = path) {
-    setBusy(true);
+    startBusy('check-path');
     try {
       const result = await validateViaTauri(nextPath || null);
       setStatus(result);
@@ -275,7 +304,7 @@ export default function App() {
       setStatus(fallback);
       setBackups([]);
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
@@ -315,7 +344,7 @@ export default function App() {
       return;
     }
 
-    setBusy(true);
+    startBusy('save-profile');
     try {
       let settingsJson: string;
       try {
@@ -343,6 +372,7 @@ export default function App() {
           name: profileName,
           tags: [structuralTag, ...splitTags(tagText)],
           settingsJson,
+          iconId: profileIconId,
         },
         { clock: systemClock, idFactory: makeProfileId },
       );
@@ -380,11 +410,12 @@ export default function App() {
         setProfileName('');
         setAccountName('');
         setTagText('');
+        setProfileIconId(DEFAULT_PROFILE_ICON_ID);
       } else if (isRecoverableProfileIndexError(saved)) {
         setProfileStoreError(saved);
       }
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
@@ -395,6 +426,7 @@ export default function App() {
     setEditKind(descriptor.kind);
     setEditAccountName(descriptor.accountName ?? '');
     setEditTags(descriptor.freeformTags.join(', '));
+    setEditIconId(normalizeProfileIconId(profile.iconId));
     setDeleteText('');
   }
 
@@ -409,7 +441,7 @@ export default function App() {
     }
 
     const structuralTag = editKind === 'shared' ? 'shared' : `account:${editAccountName.trim()}`;
-    setBusy(true);
+    startBusy('save-edits');
     try {
       const result = await renameSavedProfile(
         profileAdapter,
@@ -418,6 +450,7 @@ export default function App() {
           name: editName,
           structuralTag,
           freeformTags: splitTags(editTags),
+          iconId: editIconId,
         },
         { clock: systemClock },
       );
@@ -431,7 +464,7 @@ export default function App() {
         setActionMessage(messageForLocalStoreRecoveryPrompt('profiles'));
       }
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
@@ -445,7 +478,7 @@ export default function App() {
       return;
     }
 
-    setBusy(true);
+    startBusy('delete-profile');
     try {
       const result = await deleteProfile(profileAdapter, selectedProfile.id, deleteText);
       setActionMessage(messageForProfileDeleteResult(result));
@@ -462,7 +495,7 @@ export default function App() {
         setActionMessage(messageForLocalStoreRecoveryPrompt('profiles'));
       }
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
@@ -500,7 +533,7 @@ export default function App() {
       return;
     }
 
-    setBusy(true);
+    startBusy('confirm-apply');
     try {
       const result = await invoke<ProfileActionResult>('apply_settings_profile', {
         targetPath: path,
@@ -523,7 +556,7 @@ export default function App() {
       setPendingApplyId('');
       await checkPath(path);
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
@@ -532,7 +565,7 @@ export default function App() {
       return;
     }
 
-    setBusy(true);
+    startBusy('confirm-restore');
     try {
       const result = await invoke<ProfileActionResult>('restore_settings_backup', {
         targetPath: path,
@@ -553,12 +586,12 @@ export default function App() {
       setPendingRestorePath('');
       await checkPath(path);
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
   async function recoverProfileStore() {
-    setBusy(true);
+    startBusy('recover-profiles');
     try {
       const result = await invoke<RecoveredStore>('recover_profile_index');
       setProfileRecoveryResult(result);
@@ -574,12 +607,12 @@ export default function App() {
         tone: 'error',
       });
     } finally {
-      setBusy(false);
+      endBusy();
     }
   }
 
   async function recoverActivityStore() {
-    setBusy(true);
+    startBusy('recover-activity');
     try {
       const result = await invoke<RecoveredStore>('recover_activity_index');
       setActivityRecoveryResult(result);
@@ -592,12 +625,111 @@ export default function App() {
         tone: 'error',
       });
     } finally {
-      setBusy(false);
+      endBusy();
     }
+  }
+
+  async function handleKeepInTrayChange(enabled: boolean) {
+    setKeepInTray(enabled);
+    saveKeepInTray(enabled);
+    try {
+      await invoke('set_idle_mode', { enabled });
+    } catch {
+      // Vite-only dev runs without Tauri invoke.
+    }
+  }
+
+  function handleSelectProfile(profileId: string) {
+    setSelectedProfileId(profileId);
+    setEditingProfileId('');
+    setDeleteText('');
+  }
+
+  function focusSaveNameInput() {
+    changeTab('desk');
+    globalThis.setTimeout(() => {
+      saveNameInputRef.current?.focus();
+      saveNameInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 0);
+  }
+
+  async function runUpdateCheck(ignoreSkipped: boolean) {
+    setUpdateChecking(true);
+    try {
+      const result = await checkAppUpdate({ ignoreSkipped });
+      if (result.status === 'available') {
+        setAvailableUpdate(result);
+        return result;
+      }
+      setAvailableUpdate(null);
+      return result;
+    } finally {
+      setUpdateChecking(false);
+    }
+  }
+
+  async function handleCheckUpdates() {
+    const result = await runUpdateCheck(true);
+    if (result.status === 'available') {
+      return;
+    }
+    if (result.status === 'current') {
+      setActionMessage({
+        title: interpolate(messages.update.current, { version: result.latest }),
+        action: messages.update.check,
+        tone: 'success',
+      });
+      return;
+    }
+    setActionMessage({
+      title: messages.update.error,
+      action: messages.news.openRepo,
+      tone: 'warning',
+    });
+  }
+
+  async function handleInstallUpdate() {
+    if (!availableUpdate) {
+      return;
+    }
+    setUpdateInstalling(true);
+    setActionMessage({
+      title: messages.update.installing,
+      action: interpolate(messages.update.available, { version: availableUpdate.latest }),
+      tone: 'warning',
+    });
+    try {
+      const outcome = await startUpdateInstall(availableUpdate);
+      if (outcome === 'opened') {
+        setActionMessage({
+          title: messages.update.installFailed,
+          action: availableUpdate.name,
+          tone: 'warning',
+        });
+      }
+    } finally {
+      setUpdateInstalling(false);
+    }
+  }
+
+  function handleSkipUpdate() {
+    if (!availableUpdate) {
+      return;
+    }
+    skipUpdate(availableUpdate.latest);
+    setAvailableUpdate(null);
   }
 
   useEffect(() => {
     async function initialize() {
+      const idleEnabled = loadKeepInTray();
+      setKeepInTray(idleEnabled);
+      try {
+        await invoke('set_idle_mode', { enabled: idleEnabled });
+      } catch {
+        // Vite-only dev runs without Tauri invoke.
+      }
+
       await refreshProfiles();
       await refreshActivity();
       const stored = await loadSelectedPath(store);
@@ -606,430 +738,197 @@ export default function App() {
         setPath(detected);
         await checkPath(detected);
       }
+
+      await runUpdateCheck(false);
     }
 
     void initialize();
   }, [store]);
 
-  const pathMessage = messageForPathStatus(status);
-  const visibleMessage = actionMessage ?? activityStorageWarning ?? pathMessage;
+  const pathStrip = (
+    <section className="path-strip">
+      <label className="path-field">
+        <span>{messages.path.selected}</span>
+        <input
+          value={path}
+          disabled={busy}
+          placeholder={messages.path.placeholder}
+          onChange={(event) => setPath(event.target.value)}
+          onBlur={() => saveSelectedPath(store, path)}
+        />
+      </label>
+
+      <div className="path-actions">
+        <button type="button" className="stamp-button stamp-button-outline" onClick={chooseFile} disabled={busy}>
+          {labelBusy('choose-file', messages.path.select)}
+        </button>
+        <button type="button" className="stamp-button stamp-button-outline" onClick={() => checkPath()} disabled={busy}>
+          {labelBusy('check-path', messages.path.recheck)}
+        </button>
+      </div>
+
+      <p className="path-hint">{messages.path.hint}</p>
+    </section>
+  );
 
   return (
     <main className="shell">
-      <section className="panel">
-        <div className="top-bar">
-          <div className="heading">
-            <p className="eyebrow">League of Legends</p>
-            <h1>Settings profiles</h1>
-          </div>
-          <div className={`status status-${visibleMessage.tone}`}>
-            <strong>{visibleMessage.title}</strong>
-            <span>{visibleMessage.action}</span>
-          </div>
-        </div>
+      <AppHeader
+        status={status}
+        keepInTray={keepInTray}
+        onKeepInTrayChange={handleKeepInTrayChange}
+        disabled={busy}
+        updateAvailable={Boolean(availableUpdate)}
+        updateChecking={updateChecking}
+        onCheckUpdates={() => void handleCheckUpdates()}
+      />
 
-        <section className="path-strip">
-          <label className="path-field">
-            <span>Selected file</span>
-            <input
-              value={path}
-              placeholder={`Select ${SETTINGS_FILE_NAME}`}
-              onChange={(event) => setPath(event.target.value)}
-              onBlur={() => saveSelectedPath(store, path)}
-            />
-          </label>
+      <TabBar current={tab} onChange={changeTab} />
 
-          <div className="actions">
-            <button type="button" onClick={chooseFile} disabled={busy}>
-              Select file
-            </button>
-            <button type="button" onClick={() => checkPath()} disabled={busy}>
-              Re-check
-            </button>
+      {availableUpdate ? (
+        <UpdateBanner
+          update={availableUpdate}
+          installing={updateInstalling}
+          onInstall={() => void handleInstallUpdate()}
+          onLater={() => setAvailableUpdate(null)}
+          onSkip={handleSkipUpdate}
+        />
+      ) : null}
+
+      {profileDataNeedsRecovery ? (
+        <section className="recovery-panel recovery-panel-priority">
+          <div>
+            <h2>{messages.recovery.profilesNeed}</h2>
+            <p>{messages.recovery.profilesNeedBody}</p>
           </div>
+          <button type="button" className="stamp-button stamp-button-gold" onClick={recoverProfileStore} disabled={busy}>
+            {labelBusy('recover-profiles', messages.recovery.recoverProfiles)}
+          </button>
         </section>
+      ) : profileRecoveryResult ? (
+        <section className="recovery-panel">
+          <div>
+            <h2>{messages.recovery.profilesRecovered}</h2>
+            <p>
+              {profileRecoveryResult.preservedPath
+                ? messages.recovery.profilesPreserved
+                : messages.recovery.profilesFresh}
+            </p>
+            {profileRecoveryResult.preservedPath ? (
+              <small className="truncate-path" title={profileRecoveryResult.preservedPath}>
+                {profileRecoveryResult.preservedPath}
+              </small>
+            ) : null}
+          </div>
+          <button type="button" className="stamp-button stamp-button-outline" onClick={() => setProfileRecoveryResult(null)}>
+            {messages.common.ok}
+          </button>
+        </section>
+      ) : null}
 
-        {profileDataNeedsRecovery ? (
-          <section className="recovery-panel recovery-panel-priority">
-            <div>
-              <h2>Saved profiles need recovery</h2>
-              <p>The damaged profile list will be preserved before a fresh empty list is created.</p>
+      <div className="tab-stage">
+        {tab === 'start' ? <OnboardingTab onOpenDesk={() => changeTab('desk')} /> : null}
+
+        {tab === 'desk' ? (
+          <div className="desk-page">
+            {pathStrip}
+            <div className="desk-grid">
+              <ProfileRoster
+                groupedProfiles={groupedProfiles}
+                profileCount={profiles.length}
+                selectedProfileId={selectedProfileId}
+                onSelectProfile={handleSelectProfile}
+                onFocusSaveName={focusSaveNameInput}
+              />
+              <div className="desk-main">
+                <ProfileDossier
+                  selectedProfile={selectedProfile}
+                  selectedDescriptor={selectedDescriptor}
+                  status={status}
+                  path={path}
+                  busy={busy}
+                  profileDataNeedsRecovery={profileDataNeedsRecovery}
+                  pendingApplyProfile={pendingApplyProfile}
+                  showApplyModal={Boolean(pendingApplyProfile)}
+                  editingSelectedProfile={editingSelectedProfile}
+                  editName={editName}
+                  editKind={editKind}
+                  editAccountName={editAccountName}
+                  editTags={editTags}
+                  editIconId={editIconId}
+                  deleteText={deleteText}
+                  onApplyClick={() => selectedProfile && setPendingApplyId(selectedProfile.id)}
+                  onConfirmApply={confirmApplyProfile}
+                  onCancelApply={() => setPendingApplyId('')}
+                  onBeginEdit={beginEditProfile}
+                  onEditNameChange={setEditName}
+                  onEditKindChange={setEditKind}
+                  onEditAccountNameChange={setEditAccountName}
+                  onEditTagsChange={setEditTags}
+                  onEditIconIdChange={setEditIconId}
+                  onDeleteTextChange={setDeleteText}
+                  onSaveEdits={saveProfileEdits}
+                  onCancelEdit={() => setEditingProfileId('')}
+                  onConfirmDelete={confirmDeleteProfile}
+                  busyLabel={labelBusy}
+                />
+                <SavePanel
+                  status={status}
+                  busy={busy}
+                  profileDataNeedsRecovery={profileDataNeedsRecovery}
+                  profileName={profileName}
+                  profileKind={profileKind}
+                  accountName={accountName}
+                  tagText={tagText}
+                  profileIconId={profileIconId}
+                  saveNameInputRef={saveNameInputRef}
+                  onProfileNameChange={setProfileName}
+                  onProfileKindChange={setProfileKind}
+                  onAccountNameChange={setAccountName}
+                  onTagTextChange={setTagText}
+                  onProfileIconIdChange={setProfileIconId}
+                  onSaveCurrentProfile={saveCurrentProfile}
+                  busyLabel={labelBusy}
+                />
+              </div>
             </div>
-            <button type="button" onClick={recoverProfileStore} disabled={busy}>
-              Recover saved profiles
-            </button>
-          </section>
-        ) : profileRecoveryResult ? (
-          <section className="recovery-panel">
-            <div>
-              <h2>Saved profiles recovered</h2>
-              <p>
-                {profileRecoveryResult.preservedPath
-                  ? 'The damaged profile list was preserved before reset.'
-                  : 'A fresh profile list was created.'}
-              </p>
-              {profileRecoveryResult.preservedPath ? <small>{profileRecoveryResult.preservedPath}</small> : null}
-            </div>
-          </section>
+          </div>
         ) : null}
 
-        <div className="dashboard-grid">
-          <section className="profile-browser">
-            <div className="section-heading">
-              <h2>Saved profiles</h2>
-              <span>{profiles.length}</span>
-            </div>
+        {tab === 'history' ? (
+          <div className="history-page">
+            {pathStrip}
+            <JobSidebar
+              path={path}
+              busy={busy}
+              backups={backups}
+              pendingRestore={pendingRestore}
+              onSelectRestore={setPendingRestorePath}
+              onConfirmRestore={confirmRestoreBackup}
+              onCancelRestore={() => setPendingRestorePath('')}
+              activityRows={activityRows}
+              activityStorageWarning={activityStorageWarning}
+              activityDataNeedsRecovery={activityDataNeedsRecovery}
+              activityRecoveryResult={activityRecoveryResult}
+              onRecoverActivity={recoverActivityStore}
+              onDismissActivityRecovery={() => setActivityRecoveryResult(null)}
+              busyLabel={labelBusy}
+            />
+          </div>
+        ) : null}
 
-            <div className="profile-section">
-              <div className="profile-section-title">
-                <h3>Shared</h3>
-                <span>{groupedProfiles.shared.length}</span>
-              </div>
-              {groupedProfiles.shared.length === 0 ? (
-                <p className="empty-state">No shared profiles saved.</p>
-              ) : (
-                <div className="profile-list">
-                  {groupedProfiles.shared.map((profile) => (
-                    <ProfileButton
-                      key={profile.id}
-                      profile={profile}
-                      selected={selectedProfileId === profile.id}
-                      onSelect={() => {
-                        setSelectedProfileId(profile.id);
-                        setEditingProfileId('');
-                        setDeleteText('');
-                      }}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
+        {tab === 'news' ? (
+          <ChangelogTab
+            update={availableUpdate}
+            checking={updateChecking}
+            installing={updateInstalling}
+            onCheck={() => void handleCheckUpdates()}
+            onInstall={() => void handleInstallUpdate()}
+          />
+        ) : null}
+      </div>
 
-            <div className="profile-section">
-              <div className="profile-section-title">
-                <h3>Accounts</h3>
-                <span>{groupedProfiles.accounts.length}</span>
-              </div>
-              {groupedProfiles.accounts.length === 0 ? (
-                <p className="empty-state">No account profiles saved.</p>
-              ) : (
-                <div className="account-list">
-                  {groupedProfiles.accounts.map((group) => (
-                    <div className="account-group" key={group.structuralTag}>
-                      <div className="account-heading">
-                        <strong>{group.accountName}</strong>
-                        <small>{group.profiles.length}</small>
-                      </div>
-                      <div className="profile-list">
-                        {group.profiles.map((profile) => (
-                          <ProfileButton
-                            key={profile.id}
-                            profile={profile}
-                            selected={selectedProfileId === profile.id}
-                            onSelect={() => {
-                              setSelectedProfileId(profile.id);
-                              setEditingProfileId('');
-                              setDeleteText('');
-                            }}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </section>
-
-          <section className="details-panel">
-            <div className="section-heading">
-              <h2>Profile details</h2>
-              <span>{selectedDescriptor?.kind === 'account' ? 'Account' : 'Shared'}</span>
-            </div>
-
-            {!selectedProfile || !selectedDescriptor ? (
-              <p className="empty-state">Select a saved profile to manage it.</p>
-            ) : (
-              <div className="details-stack">
-                <div className="profile-summary">
-                  <h3>{selectedProfile.name}</h3>
-                  <div className="tag-list">
-                    <span className="tag-pill">{selectedDescriptor.structuralTag}</span>
-                    {selectedDescriptor.freeformTags.map((tag) => (
-                      <span className="tag-pill tag-pill-muted" key={tag}>
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
-                  <dl className="metadata-list">
-                    <div>
-                      <dt>Created</dt>
-                      <dd>{formatDate(selectedProfile.createdAt)}</dd>
-                    </div>
-                    <div>
-                      <dt>Updated</dt>
-                      <dd>{formatDate(selectedProfile.updatedAt)}</dd>
-                    </div>
-                  </dl>
-                </div>
-
-                <div className="actions">
-                  <button
-                    type="button"
-                    disabled={busy || status.kind !== 'valid' || profileDataNeedsRecovery}
-                    onClick={() => setPendingApplyId(selectedProfile.id)}
-                  >
-                    Review apply
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => beginEditProfile(selectedProfile)}
-                    disabled={busy || profileDataNeedsRecovery}
-                  >
-                    Edit
-                  </button>
-                </div>
-
-                {pendingApplyProfile?.id === selectedProfile.id ? (
-                  <div className="confirm-box">
-                    <strong>Apply {pendingApplyProfile.name}?</strong>
-                    <span>Type: {describeProfile(pendingApplyProfile).structuralTag}</span>
-                    <span>Target: {path}</span>
-                    <span>Backup: A backup will be created before writing.</span>
-                    <div className="actions">
-                      <button type="button" onClick={confirmApplyProfile} disabled={busy || profileDataNeedsRecovery}>
-                        Confirm apply
-                      </button>
-                      <button type="button" onClick={() => setPendingApplyId('')} disabled={busy}>
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-
-                {editingSelectedProfile ? (
-                  <div className="edit-panel">
-                    <div className="profile-form">
-                      <label>
-                        <span>Name</span>
-                        <input value={editName} onChange={(event) => setEditName(event.target.value)} />
-                      </label>
-                      <label>
-                        <span>Type</span>
-                        <select
-                          value={editKind}
-                          onChange={(event) => setEditKind(event.target.value as ProfileKind)}
-                        >
-                          <option value="shared">Shared</option>
-                          <option value="account">Account</option>
-                        </select>
-                      </label>
-                      {editKind === 'account' ? (
-                        <label>
-                          <span>Account</span>
-                          <input value={editAccountName} onChange={(event) => setEditAccountName(event.target.value)} />
-                        </label>
-                      ) : null}
-                      <label>
-                        <span>Tags</span>
-                        <input
-                          value={editTags}
-                          placeholder="optional, comma-separated"
-                          onChange={(event) => setEditTags(event.target.value)}
-                        />
-                      </label>
-                    </div>
-                    <div className="actions">
-                      <button type="button" onClick={saveProfileEdits} disabled={busy || profileDataNeedsRecovery}>
-                        Save changes
-                      </button>
-                      <button type="button" onClick={() => setEditingProfileId('')} disabled={busy}>
-                        Cancel
-                      </button>
-                    </div>
-
-                    <div className="danger-zone">
-                      <strong>Delete profile</strong>
-                      <span>Type {selectedProfile.name} to remove only this saved profile entry.</span>
-                      <input value={deleteText} onChange={(event) => setDeleteText(event.target.value)} />
-                      <button type="button" onClick={confirmDeleteProfile} disabled={busy || profileDataNeedsRecovery}>
-                        Delete profile
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            )}
-          </section>
-
-          <aside className="side-stack">
-            <section className="save-panel">
-              <div className="section-heading">
-                <h2>Save current</h2>
-                <span>{status.kind === 'valid' ? 'Ready' : 'Needs file'}</span>
-              </div>
-
-              <div className="profile-form profile-form-single">
-                <label>
-                  <span>Name</span>
-                  <input value={profileName} onChange={(event) => setProfileName(event.target.value)} />
-                </label>
-                <label>
-                  <span>Type</span>
-                  <select value={profileKind} onChange={(event) => setProfileKind(event.target.value as ProfileKind)}>
-                    <option value="shared">Shared</option>
-                    <option value="account">Account</option>
-                  </select>
-                </label>
-                {profileKind === 'account' ? (
-                  <label>
-                    <span>Account</span>
-                    <input value={accountName} onChange={(event) => setAccountName(event.target.value)} />
-                  </label>
-                ) : null}
-                <label>
-                  <span>Tags</span>
-                  <input
-                    value={tagText}
-                    placeholder="optional, comma-separated"
-                    onChange={(event) => setTagText(event.target.value)}
-                  />
-                </label>
-              </div>
-
-              <div className="actions">
-                <button
-                  type="button"
-                  onClick={saveCurrentProfile}
-                  disabled={busy || status.kind !== 'valid' || profileDataNeedsRecovery}
-                >
-                  Save profile
-                </button>
-              </div>
-            </section>
-
-            <section className="backup-panel">
-              <div className="section-heading">
-                <h2>Recent backups</h2>
-                <span>{backups.length}</span>
-              </div>
-
-              {backups.length === 0 ? (
-                <p className="empty-state">No backups for the selected file yet.</p>
-              ) : (
-                <div className="backup-list">
-                  {backups.map((backup) => (
-                    <button
-                      className="backup-row"
-                      type="button"
-                      key={backup.path}
-                      onClick={() => setPendingRestorePath(backup.path)}
-                    >
-                      <strong>{formatDate(backup.createdAt)}</strong>
-                      <small>{backup.path}</small>
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              {pendingRestore ? (
-                <div className="confirm-box">
-                  <strong>Restore this backup?</strong>
-                  <span>Backup: {formatDate(pendingRestore.createdAt)}</span>
-                  <span>Target: {path}</span>
-                  <span>Current settings will be backed up first.</span>
-                  <div className="actions">
-                    <button type="button" onClick={confirmRestoreBackup} disabled={busy}>
-                      Confirm restore
-                    </button>
-                    <button type="button" onClick={() => setPendingRestorePath('')} disabled={busy}>
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-            </section>
-
-            <section className="activity-panel">
-              <div className="section-heading">
-                <h2>Activity</h2>
-                <span>{activityRows.length}</span>
-              </div>
-
-              {activityStorageWarning ? (
-                <div className="activity-warning">
-                  <strong>{activityStorageWarning.title}</strong>
-                  <span>{activityStorageWarning.action}</span>
-                </div>
-              ) : null}
-
-              {activityDataNeedsRecovery ? (
-                <div className="recovery-callout">
-                  <strong>Activity needs recovery</strong>
-                  <span>The damaged activity file will be preserved before a fresh empty list is created.</span>
-                  <button type="button" onClick={recoverActivityStore} disabled={busy}>
-                    Recover activity
-                  </button>
-                </div>
-              ) : activityRecoveryResult ? (
-                <div className="recovery-callout recovery-callout-success">
-                  <strong>Activity recovered</strong>
-                  <span>
-                    {activityRecoveryResult.preservedPath
-                      ? 'The damaged activity file was preserved before reset.'
-                      : 'A fresh activity list was created.'}
-                  </span>
-                  {activityRecoveryResult.preservedPath ? <small>{activityRecoveryResult.preservedPath}</small> : null}
-                </div>
-              ) : null}
-
-              {!activityDataNeedsRecovery && activityRows.length === 0 ? (
-                <p className="empty-state">No save, apply, or restore activity yet.</p>
-              ) : null}
-
-              {!activityDataNeedsRecovery && activityRows.length > 0 ? (
-                <div className="activity-list">
-                  {activityRows.map((entry) => (
-                    <article className={`activity-row activity-row-${entry.status}`} key={entry.id}>
-                      <div className="activity-row-top">
-                        <span className="activity-action">{activityActionLabel(entry.action)}</span>
-                        <time>{formatDate(entry.occurredAt)}</time>
-                      </div>
-                      <strong>{entry.title}</strong>
-                      <p>{entry.message}</p>
-                      {entry.friendlyCode ? (
-                        <span className="activity-code">Code: {formatFriendlyCode(entry.friendlyCode)}</span>
-                      ) : null}
-                      {entry.profileName || entry.backupPath || entry.targetPath ? (
-                        <dl className="activity-context">
-                          {entry.profileName ? (
-                            <div>
-                              <dt>Profile</dt>
-                              <dd>{entry.profileName}</dd>
-                            </div>
-                          ) : null}
-                          {entry.backupPath ? (
-                            <div>
-                              <dt>Backup</dt>
-                              <dd>{entry.backupPath}</dd>
-                            </div>
-                          ) : null}
-                          {entry.targetPath ? (
-                            <div>
-                              <dt>Target</dt>
-                              <dd>{entry.targetPath}</dd>
-                            </div>
-                          ) : null}
-                        </dl>
-                      ) : null}
-                    </article>
-                  ))}
-                </div>
-              ) : null}
-            </section>
-          </aside>
-        </div>
-      </section>
+      <ActionToast message={actionMessage} onDismiss={() => setActionMessage(null)} />
     </main>
   );
 }

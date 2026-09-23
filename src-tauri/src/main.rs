@@ -1,8 +1,14 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+struct IdleMode(AtomicBool);
 
 const SETTINGS_FILE_NAME: &str = "PersistedSettings.json";
 const DEFAULT_SETTINGS_PATH: &str = r"C:\Riot Games\League of Legends\Config\PersistedSettings.json";
@@ -430,8 +436,108 @@ fn restore_settings_backup(app: tauri::AppHandle, target_path: String, backup_pa
     safe_write_settings(&app, target_path, contents)
 }
 
+#[tauri::command]
+fn set_idle_mode(mode: tauri::State<IdleMode>, enabled: bool) {
+    mode.0.store(enabled, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn get_idle_mode(mode: tauri::State<IdleMode>) -> bool {
+    mode.0.load(Ordering::SeqCst)
+}
+
+fn allowed_update_url(url: &str) -> bool {
+    url.starts_with("https://github.com/gfaraujosousa/lol-settings-changer/releases/download/")
+}
+
+fn sanitize_installer_name(name: &str) -> Result<String, String> {
+    let normalized = name.replace('\\', "/");
+    let base = normalized.rsplit('/').next().unwrap_or("").to_string();
+    if base.is_empty() || !base.to_ascii_lowercase().ends_with(".exe") {
+        return Err("Invalid installer name.".to_string());
+    }
+    if !base
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ' '))
+    {
+        return Err("Invalid installer name.".to_string());
+    }
+    Ok(base.to_string())
+}
+
+#[tauri::command]
+async fn install_app_update(url: String, file_name: String) -> Result<(), String> {
+    if !allowed_update_url(&url) {
+        return Err("Update URL is not allowed.".to_string());
+    }
+
+    let file_name = sanitize_installer_name(&file_name)?;
+    let bytes = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(&url)
+        .header("User-Agent", "lol-settings-changer")
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .bytes()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let path = std::env::temp_dir().join(&file_name);
+    fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+
+    std::process::Command::new(&path)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn main() {
+    let show = CustomMenuItem::new("show".to_string(), "Show");
+    let quit = CustomMenuItem::new("quit".to_string(), "Quit");
+    let tray_menu = SystemTrayMenu::new()
+        .add_item(show)
+        .add_native_item(SystemTrayMenuItem::Separator)
+        .add_item(quit);
+    let system_tray = SystemTray::new().with_menu(tray_menu);
+
     tauri::Builder::default()
+        .manage(IdleMode(AtomicBool::new(false)))
+        .system_tray(system_tray)
+        .on_system_tray_event(|app, event| match event {
+            SystemTrayEvent::LeftClick { .. } => {
+                show_main_window(app);
+            }
+            SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
+                "show" => show_main_window(app),
+                "quit" => app.exit(0),
+                _ => {}
+            },
+            _ => {}
+        })
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+                let idle_mode = event.window().state::<IdleMode>();
+                if idle_mode.0.load(Ordering::SeqCst) {
+                    let _ = event.window().hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             detect_default_settings_path,
             validate_settings_path,
@@ -444,7 +550,10 @@ fn main() {
             recover_activity_index,
             apply_settings_profile,
             list_settings_backups,
-            restore_settings_backup
+            restore_settings_backup,
+            set_idle_mode,
+            get_idle_mode,
+            install_app_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

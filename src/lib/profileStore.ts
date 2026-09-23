@@ -1,3 +1,4 @@
+import { DEFAULT_PROFILE_ICON_ID, normalizeProfileIconId, type ProfileIconId } from './profileIcons';
 import type { Clock } from './types';
 
 export interface SettingsProfile {
@@ -7,6 +8,7 @@ export interface SettingsProfile {
   createdAt: string;
   updatedAt: string;
   settingsJson: string;
+  iconId?: ProfileIconId;
 }
 
 export interface ProfileIndex {
@@ -38,6 +40,7 @@ export interface CreateProfileInput {
   name: string;
   tags: string[];
   settingsJson: string;
+  iconId?: ProfileIconId;
 }
 
 export type ProfileKind = 'shared' | 'account';
@@ -69,6 +72,7 @@ export interface RenameProfileInput {
   name: string;
   structuralTag: string;
   freeformTags: string[];
+  iconId?: ProfileIconId;
 }
 
 export interface RenameProfileOptions {
@@ -200,7 +204,15 @@ export function validateProfileInput(input: CreateProfileInput): ProfileStoreRes
     };
   }
 
-  return { ok: true, value: { name, tags, settingsJson: input.settingsJson } };
+  return {
+    ok: true,
+    value: {
+      name,
+      tags,
+      settingsJson: input.settingsJson,
+      iconId: normalizeProfileIconId(input.iconId),
+    },
+  };
 }
 
 export function createProfile(
@@ -222,6 +234,7 @@ export function createProfile(
       createdAt: now,
       updatedAt: now,
       settingsJson: validation.value.settingsJson,
+      iconId: validation.value.iconId ?? DEFAULT_PROFILE_ICON_ID,
     },
   };
 }
@@ -235,6 +248,7 @@ export function renameProfile(
     name: input.name,
     tags: [input.structuralTag, ...input.freeformTags],
     settingsJson: profile.settingsJson,
+    iconId: input.iconId ?? profile.iconId,
   });
 
   if (!validation.ok) {
@@ -247,6 +261,7 @@ export function renameProfile(
       ...profile,
       name: validation.value.name,
       tags: validation.value.tags,
+      iconId: validation.value.iconId ?? DEFAULT_PROFILE_ICON_ID,
       updatedAt: options.clock.now().toISOString(),
     },
   };

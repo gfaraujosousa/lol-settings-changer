@@ -44,6 +44,7 @@ describe('createProfile', () => {
         createdAt: '2026-01-01T00:00:00.000Z',
         updatedAt: '2026-01-01T00:00:00.000Z',
         settingsJson: '{"hudScale":1}',
+        iconId: 'horned-gear',
       });
     }
   });
@@ -53,6 +54,18 @@ describe('createProfile', () => {
 
     expect(result.ok).toBe(true);
     expect(result.ok ? result.value.tags : []).toEqual(['account:bot lane', 'camera']);
+  });
+
+  it('defaults to the horned-gear badge', () => {
+    const result = makeProfile();
+
+    expect(result.ok ? result.value.iconId : null).toBe('horned-gear');
+  });
+
+  it('stores a chosen badge icon', () => {
+    const result = makeProfile({ iconId: 'crossed-blades' });
+
+    expect(result.ok ? result.value.iconId : null).toBe('crossed-blades');
   });
 
   it('rejects empty names', () => {
@@ -145,6 +158,7 @@ describe('profile updates', () => {
         updatedAt: '2026-01-02T00:00:00.000Z',
         settingsJson: profile.value.settingsJson,
         tags: ['account:Main', 'ranked', 'camera'],
+        iconId: 'horned-gear',
       });
     }
   });
